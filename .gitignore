@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+
+# Data and Database
+chroma_db/
+chat_history/
+md5.text
+
+# IDE
+.vscode/
+.idea/
