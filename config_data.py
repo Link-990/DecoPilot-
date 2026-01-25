@@ -1,5 +1,9 @@
 
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 md5_path = "./md5.text"
 
@@ -13,7 +17,7 @@ if dashscope_api_key:
 collection_name = "rag"
 persist_directory = "./chroma_db"
 # api key
-api_key = "sk-xxxx"
+# api_key = os.getenv("DASHSCOPE_API_KEY", "")
 
 # spliter
 chunk_size = 1000
@@ -22,7 +26,9 @@ separators = ["\n\n", "\n", ".", "!", "?", "。", "！", "？", " ", ""]
 max_split_char_number = 1000        # 文本分割的阈值
 
 #
-similarity_threshold = 1            # 检索返回匹配的文档数量
+similarity_threshold = 4            # 检索返回匹配的文档数量
+search_score_threshold = 0.8        # 混合检索阈值 (L2距离)：高于此值视为不相关，将触发联网搜索
+
 
 embedding_model_name = "text-embedding-v4"
 chat_model_name = "qwen3-max"
