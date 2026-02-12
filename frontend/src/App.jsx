@@ -292,11 +292,16 @@ function App() {
     }
     setIsLoading(false);
     setIsUploadingImage(false);
-    setMessages(prev => prev.map(msg =>
-      msg.role === 'assistant' && !msg.isComplete
-        ? { ...msg, isComplete: true, content: msg.content !== '' ? msg.content : '（已停止生成）' }
-        : msg
-    ));
+    // 注意：如果是 regenerateAnswer 中的中断，版本保存由 regenerateAnswer 的 catch(AbortError) 处理
+    // 这里只处理普通 sendMessage 的中断
+    setMessages(prev => prev.map(msg => {
+      if (msg.role !== 'assistant' || msg.isComplete) return msg;
+      return {
+        ...msg,
+        isComplete: true,
+        content: msg.content !== '' ? msg.content : '（已停止生成）'
+      };
+    }));
   };
 
   // ===== 复制到剪贴板 =====
@@ -340,8 +345,10 @@ function App() {
     setTimeout(() => sendMessage(newContent), 50);
   };
 
-  // ===== 重新回答 =====
-  const regenerateAnswer = (aiMsgIdx) => {
+  // ===== 重新回答（多版本） =====
+  const regenerateAnswer = async (aiMsgIdx) => {
+    if (isLoading) return;
+
     // 找到该 AI 消息前面最近的 user 消息
     let userMsgIdx = aiMsgIdx - 1;
     while (userMsgIdx >= 0 && messages[userMsgIdx].role !== 'user') {
@@ -349,11 +356,153 @@ function App() {
     }
     if (userMsgIdx < 0) return;
     const userContent = messages[userMsgIdx].content;
-    // 截断到 user 消息（含）
-    const truncated = messages.slice(0, userMsgIdx + 1);
-    setMessages(truncated);
-    // 重新发送
-    setTimeout(() => sendMessage(userContent), 50);
+    const aiMsg = messages[aiMsgIdx];
+
+    // 将当前回答保存为版本历史
+    const currentVersion = {
+      content: aiMsg.content,
+      thinking: aiMsg.thinking,
+      expertInfo: aiMsg.expertInfo,
+      structuredBlocks: aiMsg.structuredBlocks,
+      feedback: aiMsg.feedback,
+      feedbackReason: aiMsg.feedbackReason,
+      timestamp: aiMsg.timestamp,
+    };
+
+    const existingVersions = aiMsg.versions || [currentVersion];
+    // 如果 versions 还没初始化，当前内容就是第一个版本
+    const versions = aiMsg.versions ? [...existingVersions] : [currentVersion];
+
+    // 创建新的空版本占位
+    const newVersionIdx = versions.length;
+
+    enableAutoScroll();
+    setIsLoading(true);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const newMsgId = `regen-${Date.now()}`;
+
+    // 更新消息：清空当前内容，准备接收新版本
+    setMessages(prev => prev.map((msg, idx) => {
+      if (idx !== aiMsgIdx) return msg;
+      return {
+        ...msg,
+        versions,
+        activeVersion: newVersionIdx,
+        content: '',
+        thinking: [],
+        expertInfo: null,
+        structuredBlocks: [],
+        feedback: null,
+        feedbackReason: null,
+        isComplete: false,
+        id: newMsgId,
+        timestamp: Date.now(),
+      };
+    }));
+
+    try {
+      const activeId = currentChatId;
+      const endpoint = userType === 'c_end' ? '/api/v1/chat/c-end' : '/api/v1/chat/b-end';
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userContent,
+          session_id: `${userType}_${activeId}`,
+          enable_search: enableSearch,
+          show_thinking: showThinking
+        }),
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        const legacyResponse = await fetch('/chat_stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: userContent, enable_search: enableSearch, show_thinking: showThinking }),
+          signal: controller.signal
+        });
+        if (!legacyResponse.ok) throw new Error('Server error');
+        await processStream(legacyResponse, newMsgId);
+      } else {
+        await processStream(response, newMsgId);
+      }
+
+      // 生成完成后，将新内容保存到 versions
+      setMessages(prev => prev.map(msg => {
+        if (msg.id !== newMsgId) return msg;
+        const newVersion = {
+          content: msg.content,
+          thinking: msg.thinking,
+          expertInfo: msg.expertInfo,
+          structuredBlocks: msg.structuredBlocks,
+          feedback: msg.feedback,
+          feedbackReason: msg.feedbackReason,
+          timestamp: msg.timestamp,
+        };
+        return { ...msg, versions: [...(msg.versions || []), newVersion] };
+      }));
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        // 用户中断了重新生成，将已生成的内容保存为新版本
+        setMessages(prev => prev.map(msg => {
+          if (msg.id !== newMsgId) return msg;
+          // 只有当消息有内容时才保存为版本
+          if (msg.versions && !msg.isComplete) {
+            const stoppedVersion = {
+              content: msg.content !== '' ? msg.content : '（已停止生成）',
+              thinking: msg.thinking,
+              expertInfo: msg.expertInfo,
+              structuredBlocks: msg.structuredBlocks,
+              feedback: null,
+              feedbackReason: null,
+              timestamp: msg.timestamp,
+            };
+            return {
+              ...msg,
+              versions: [...msg.versions, stoppedVersion],
+              isComplete: true,
+              content: stoppedVersion.content,
+            };
+          }
+          return msg;
+        }));
+        return;
+      }
+      setMessages(prev => prev.map(msg =>
+        msg.id === newMsgId
+          ? { ...msg, content: msg.content !== '' ? msg.content : '⚠️ 重新生成失败，请重试。', isComplete: true }
+          : msg
+      ));
+    } finally {
+      setIsLoading(false);
+      abortControllerRef.current = null;
+    }
+  };
+
+  // ===== 切换回答版本 =====
+  const switchVersion = (msgId, versionIdx) => {
+    setMessages(prev => prev.map(msg => {
+      if (msg.id !== msgId && !(msg.versions && msg.versions.length > 0)) return msg;
+      // 通过 versions 数组中的 msgId 或当前 msg.id 匹配
+      if (msg.id !== msgId) return msg;
+      const version = msg.versions[versionIdx];
+      if (!version) return msg;
+      return {
+        ...msg,
+        activeVersion: versionIdx,
+        content: version.content,
+        thinking: version.thinking,
+        expertInfo: version.expertInfo,
+        structuredBlocks: version.structuredBlocks,
+        feedback: version.feedback,
+        feedbackReason: version.feedbackReason,
+        isComplete: true,
+      };
+    }));
   };
 
   // ===== 评价回答 =====
@@ -1275,6 +1424,28 @@ function App() {
                               >
                                 <RefreshCw size={14} />
                               </button>
+                              {/* 版本切换 */}
+                              {msg.versions && msg.versions.length > 1 && (
+                                <div className="flex items-center gap-0.5 ml-0.5">
+                                  <button
+                                    onClick={() => switchVersion(msg.id, (msg.activeVersion || 0) - 1)}
+                                    disabled={(msg.activeVersion || 0) === 0}
+                                    className="p-1 rounded text-slate-300 hover:text-slate-500 hover:bg-slate-100 transition-colors disabled:opacity-20 disabled:cursor-default"
+                                  >
+                                    <ChevronRight size={14} className="rotate-180" />
+                                  </button>
+                                  <span className="text-[11px] text-slate-400 font-mono min-w-[32px] text-center">
+                                    {(msg.activeVersion || 0) + 1}/{msg.versions.length}
+                                  </span>
+                                  <button
+                                    onClick={() => switchVersion(msg.id, (msg.activeVersion || 0) + 1)}
+                                    disabled={(msg.activeVersion || 0) >= msg.versions.length - 1}
+                                    className="p-1 rounded text-slate-300 hover:text-slate-500 hover:bg-slate-100 transition-colors disabled:opacity-20 disabled:cursor-default"
+                                  >
+                                    <ChevronRight size={14} />
+                                  </button>
+                                </div>
+                              )}
                               {/* 分隔线 */}
                               <div className="w-px h-3.5 bg-slate-150 mx-0.5" />
                               {/* 点赞 */}
