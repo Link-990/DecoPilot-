@@ -4,6 +4,7 @@
 """
 import json
 import time
+import config_data as config
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 from dataclasses import dataclass, asdict
@@ -39,6 +40,10 @@ class OutputType(str, Enum):
 
     # 诊断类型
     EXPERT_DEBUG = "expert_debug"      # 专家系统诊断信息
+
+    # 深度研究类型
+    RESEARCH_PROGRESS = "research_progress"    # 研究进度事件
+    RESEARCH_REPORT = "research_report"        # 研究报告头部（标题+目录）
 
 
 @dataclass
@@ -154,6 +159,7 @@ class OutputFormatter:
             "type": output_type.value,
             "data": self._serialize(data),
             "timestamp": datetime.now().isoformat(),
+            "protocol_version": getattr(config, "PROTOCOL_VERSION", "1.0"),
         }
         return json.dumps(output, ensure_ascii=False) + "\n"
 
@@ -179,6 +185,7 @@ class OutputFormatter:
         output = {
             "type": "thinking",
             "content": logs,
+            "protocol_version": getattr(config, "PROTOCOL_VERSION", "1.0"),
         }
         if reasoning_type:
             output["reasoning_type"] = reasoning_type
@@ -190,6 +197,7 @@ class OutputFormatter:
         output = {
             "type": "answer",
             "content": content,
+            "protocol_version": getattr(config, "PROTOCOL_VERSION", "1.0"),
         }
         return json.dumps(output, ensure_ascii=False) + "\n"
 
@@ -241,6 +249,25 @@ class OutputFormatter:
             "data": data,
         }
         return json.dumps(output, ensure_ascii=False) + "\n"
+
+    # === 深度研究输出方法 ===
+
+    def research_progress(self, step: int, total: int, label: str) -> str:
+        """研究进度事件"""
+        return self.format(OutputType.RESEARCH_PROGRESS, {
+            "step": step,
+            "total": total,
+            "label": label,
+        })
+
+    def research_report_header(self, title: str, research_type: str,
+                                sections: List[str]) -> str:
+        """研究报告头部（标题+目录）"""
+        return self.format(OutputType.RESEARCH_REPORT, {
+            "title": title,
+            "research_type": research_type,
+            "sections": sections,
+        })
 
     # === 结构化数据输出方法 ===
 

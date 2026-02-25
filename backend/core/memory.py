@@ -19,8 +19,18 @@ from pathlib import Path
 from contextlib import contextmanager
 
 from backend.core.logging_config import get_logger
+import config_data as config
 
 logger = get_logger("memory")
+
+
+def _ensure_private_permissions(path: str, is_dir: bool = False) -> None:
+    """尽量收紧本地文件/目录权限（仅在类Unix系统生效）"""
+    try:
+        if os.name == "posix":
+            os.chmod(path, 0o700 if is_dir else 0o600)
+    except Exception:
+        pass
 
 
 class MemoryType(str, Enum):
@@ -1011,9 +1021,11 @@ class SQLiteMemoryStore(MemoryStore):
 
         # 确保目录存在
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        _ensure_private_permissions(os.path.dirname(db_path), is_dir=True)
 
         # 初始化数据库
         self._init_db()
+        _ensure_private_permissions(self.db_path)
 
         logger.info(f"SQLite 记忆存储初始化完成: {db_path}")
 
@@ -1272,6 +1284,24 @@ class SQLiteMemoryStore(MemoryStore):
             except Exception as e:
                 logger.error(f"SQLite VACUUM 失败: {e}")
 
+    def prune_older_than(self, days: int) -> int:
+        """删除早于指定天数的记忆"""
+        if days <= 0:
+            return 0
+        cutoff = time.time() - days * 86400
+        with self._lock:
+            try:
+                with self._get_connection() as conn:
+                    cur = conn.execute(
+                        "DELETE FROM memories WHERE created_at < ?",
+                        (cutoff,)
+                    )
+                    conn.commit()
+                    return cur.rowcount or 0
+            except Exception as e:
+                logger.error(f"SQLite prune 失败: {e}")
+                return 0
+
     def close(self):
         """关闭数据库连接"""
         if hasattr(self._local, 'conn') and self._local.conn:
@@ -1279,98 +1309,226 @@ class SQLiteMemoryStore(MemoryStore):
             self._local.conn = None
 
 
-class UserProfileStore:
+class SQLiteProfileStore:
     """
-    用户画像持久化存储
+    用户画像 SQLite 持久化存储
+
+    替代原有的 JSON 文件存储，提供：
+    - 原子写入（每次只更新单个 profile，不全量写盘）
+    - WAL 模式并发读写
+    - 行级更新，不阻塞其他用户
     """
 
-    def __init__(self, storage_path: str):
-        self.storage_path = storage_path
+    def __init__(self, db_path: str, legacy_json_path: str = None):
+        self.db_path = db_path
         self._profiles: Dict[str, UserProfile] = {}
         self._lock = threading.RLock()
-        self._dirty = False
-        self._load()
+        self._dirty_users: set = set()  # 只追踪哪些用户需要写盘
+        self._init_db()
+        self._load_all()
+        # 如果存在旧的 JSON 文件，自动迁移
+        if legacy_json_path and os.path.exists(legacy_json_path):
+            self._migrate_from_json(legacy_json_path)
 
-    def _load(self):
-        """加载用户画像"""
-        if not os.path.exists(self.storage_path):
-            return
-
+    def _init_db(self):
+        """初始化数据库表"""
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        _ensure_private_permissions(os.path.dirname(self.db_path), is_dir=True)
+        conn = sqlite3.connect(self.db_path)
         try:
-            with open(self.storage_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            for user_id, profile_data in data.get("profiles", {}).items():
-                profile = UserProfile(
-                    user_id=profile_data["user_id"],
-                    user_type=profile_data.get("user_type", "c_end"),
-                    name=profile_data.get("name"),
-                    city=profile_data.get("city"),
-                    budget_range=tuple(profile_data["budget_range"]) if profile_data.get("budget_range") else None,
-                    preferred_styles=profile_data.get("preferred_styles", []),
-                    house_area=profile_data.get("house_area"),
-                    decoration_stage=profile_data.get("decoration_stage"),
-                    shop_name=profile_data.get("shop_name"),
-                    shop_category=profile_data.get("shop_category"),
-                    monthly_orders=profile_data.get("monthly_orders"),
-                    interests=profile_data.get("interests", {}),
-                    interaction_history=profile_data.get("interaction_history", [])[-100:],
-                    communication_style=profile_data.get("communication_style", "friendly"),
-                    response_detail_level=profile_data.get("response_detail_level", "medium"),
-                    created_at=profile_data.get("created_at", time.time()),
-                    updated_at=profile_data.get("updated_at", time.time()),
-                    total_sessions=profile_data.get("total_sessions", 0),
-                    total_messages=profile_data.get("total_messages", 0),
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    user_type TEXT NOT NULL DEFAULT 'c_end',
+                    profile_data TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
                 )
-                self._profiles[user_id] = profile
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_profile_user_type ON user_profiles(user_type)")
+            conn.commit()
+        finally:
+            conn.close()
+        _ensure_private_permissions(self.db_path)
 
-            logger.info(f"加载 {len(self._profiles)} 个用户画像")
-        except Exception as e:
-            logger.error(f"加载用户画像失败: {e}")
-
-    def _save(self):
-        """保存用户画像"""
+    @contextmanager
+    def _get_conn(self):
+        """获取数据库连接"""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
         try:
-            os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
+            yield conn
+        finally:
+            conn.close()
 
-            data = {
-                "version": "1.0",
-                "saved_at": datetime.now().isoformat(),
-                "profiles": {}
+    def _profile_to_dict(self, profile: UserProfile) -> dict:
+        """将 UserProfile 序列化为 dict"""
+        journey_data = None
+        if profile.decoration_journey:
+            j = profile.decoration_journey
+            journey_data = {
+                "current_stage": j.current_stage,
+                "stage_start_date": j.stage_start_date,
+                "completed_stages": j.completed_stages,
+                "stage_notes": j.stage_notes,
+                "expected_completion": j.expected_completion,
+                "actual_progress": j.actual_progress,
+                "decisions": j.decisions,
+                "stage_transitions": j.stage_transitions,
             }
 
-            for user_id, profile in self._profiles.items():
-                data["profiles"][user_id] = {
-                    "user_id": profile.user_id,
-                    "user_type": profile.user_type,
-                    "name": profile.name,
-                    "city": profile.city,
-                    "budget_range": list(profile.budget_range) if profile.budget_range else None,
-                    "preferred_styles": profile.preferred_styles,
-                    "house_area": profile.house_area,
-                    "decoration_stage": profile.decoration_stage,
-                    "shop_name": profile.shop_name,
-                    "shop_category": profile.shop_category,
-                    "monthly_orders": profile.monthly_orders,
-                    "interests": profile.interests,
-                    "interaction_history": profile.interaction_history[-100:],
-                    "communication_style": profile.communication_style,
-                    "response_detail_level": profile.response_detail_level,
-                    "created_at": profile.created_at,
-                    "updated_at": profile.updated_at,
-                    "total_sessions": profile.total_sessions,
-                    "total_messages": profile.total_messages,
-                }
+        factors_data = None
+        if profile.decision_factors:
+            df = profile.decision_factors
+            factors_data = {
+                "price_sensitivity": df.price_sensitivity,
+                "quality_preference": df.quality_preference,
+                "brand_preference": df.brand_preference,
+                "eco_preference": df.eco_preference,
+                "style_consistency": df.style_consistency,
+                "decision_speed": df.decision_speed,
+            }
 
-            temp_path = self.storage_path + ".tmp"
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+        return {
+            "user_id": profile.user_id,
+            "user_type": profile.user_type,
+            "name": profile.name,
+            "city": profile.city,
+            "budget_range": list(profile.budget_range) if profile.budget_range else None,
+            "preferred_styles": profile.preferred_styles,
+            "house_area": profile.house_area,
+            "decoration_stage": profile.decoration_stage,
+            "decoration_journey": journey_data,
+            "decision_factors": factors_data,
+            "pain_points": profile.pain_points[-20:],
+            "extra_info": getattr(profile, 'extra_info', None),
+            "shop_name": profile.shop_name,
+            "shop_category": profile.shop_category,
+            "monthly_orders": profile.monthly_orders,
+            "interests": profile.interests,
+            "interaction_history": profile.interaction_history[-100:],
+            "communication_style": profile.communication_style,
+            "response_detail_level": profile.response_detail_level,
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+            "total_sessions": profile.total_sessions,
+            "total_messages": profile.total_messages,
+        }
 
-            os.replace(temp_path, self.storage_path)
-            self._dirty = False
-            logger.debug(f"保存 {len(self._profiles)} 个用户画像")
+    def _dict_to_profile(self, data: dict) -> UserProfile:
+        """将 dict 反序列化为 UserProfile"""
+        journey = None
+        journey_data = data.get("decoration_journey")
+        if journey_data:
+            journey = DecorationJourney(
+                current_stage=journey_data.get("current_stage", "准备"),
+                stage_start_date=journey_data.get("stage_start_date"),
+                completed_stages=journey_data.get("completed_stages", []),
+                stage_notes=journey_data.get("stage_notes", {}),
+                expected_completion=journey_data.get("expected_completion"),
+                actual_progress=journey_data.get("actual_progress", 0.0),
+                decisions=journey_data.get("decisions", {}),
+                stage_transitions=journey_data.get("stage_transitions", []),
+            )
+
+        factors = None
+        factors_data = data.get("decision_factors")
+        if factors_data:
+            factors = DecisionFactors(
+                price_sensitivity=factors_data.get("price_sensitivity", 0.5),
+                quality_preference=factors_data.get("quality_preference", 0.5),
+                brand_preference=factors_data.get("brand_preference", 0.5),
+                eco_preference=factors_data.get("eco_preference", 0.5),
+                style_consistency=factors_data.get("style_consistency", 0.5),
+                decision_speed=factors_data.get("decision_speed", "moderate"),
+            )
+
+        profile = UserProfile(
+            user_id=data["user_id"],
+            user_type=data.get("user_type", "c_end"),
+            name=data.get("name"),
+            city=data.get("city"),
+            budget_range=tuple(data["budget_range"]) if data.get("budget_range") else None,
+            preferred_styles=data.get("preferred_styles", []),
+            house_area=data.get("house_area"),
+            decoration_stage=data.get("decoration_stage"),
+            decoration_journey=journey,
+            decision_factors=factors,
+            pain_points=data.get("pain_points", []),
+            shop_name=data.get("shop_name"),
+            shop_category=data.get("shop_category"),
+            monthly_orders=data.get("monthly_orders"),
+            interests=data.get("interests", {}),
+            interaction_history=data.get("interaction_history", [])[-100:],
+            communication_style=data.get("communication_style", "friendly"),
+            response_detail_level=data.get("response_detail_level", "medium"),
+            created_at=data.get("created_at", time.time()),
+            updated_at=data.get("updated_at", time.time()),
+            total_sessions=data.get("total_sessions", 0),
+            total_messages=data.get("total_messages", 0),
+        )
+        extra_info = data.get("extra_info")
+        if extra_info:
+            profile.extra_info = extra_info
+        return profile
+
+    def _load_all(self):
+        """从 SQLite 加载所有用户画像到内存"""
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT user_id, profile_data FROM user_profiles")
+            for row in cursor:
+                try:
+                    data = json.loads(row[1])
+                    self._profiles[row[0]] = self._dict_to_profile(data)
+                except Exception as e:
+                    logger.error(f"加载用户画像失败 {row[0]}: {e}")
+        logger.info(f"从 SQLite 加载 {len(self._profiles)} 个用户画像")
+
+    def _save_profile(self, user_id: str):
+        """保存单个用户画像到 SQLite"""
+        profile = self._profiles.get(user_id)
+        if not profile:
+            return
+        data = self._profile_to_dict(profile)
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO user_profiles (user_id, user_type, profile_data, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       user_type = excluded.user_type,
+                       profile_data = excluded.profile_data,
+                       updated_at = excluded.updated_at""",
+                (user_id, profile.user_type, json.dumps(data, ensure_ascii=False),
+                 profile.created_at, profile.updated_at)
+            )
+            conn.commit()
+
+    def _migrate_from_json(self, json_path: str):
+        """从旧的 JSON 文件迁移数据到 SQLite"""
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            migrated = 0
+            for user_id, profile_data in data.get("profiles", {}).items():
+                if user_id not in self._profiles:
+                    try:
+                        profile = self._dict_to_profile(profile_data)
+                        self._profiles[user_id] = profile
+                        self._save_profile(user_id)
+                        migrated += 1
+                    except Exception as e:
+                        logger.error(f"迁移用户画像失败 {user_id}: {e}")
+
+            if migrated > 0:
+                logger.info(f"从 JSON 迁移 {migrated} 个用户画像到 SQLite")
+                # 重命名旧文件作为备份
+                backup_path = json_path + ".migrated"
+                os.rename(json_path, backup_path)
+                logger.info(f"旧 JSON 文件已备份为 {backup_path}")
         except Exception as e:
-            logger.error(f"保存用户画像失败: {e}")
+            logger.error(f"JSON 迁移失败: {e}")
 
     def get(self, user_id: str) -> Optional[UserProfile]:
         """获取用户画像"""
@@ -1385,7 +1543,7 @@ class UserProfileStore:
                     user_id=user_id,
                     user_type=user_type
                 )
-                self._dirty = True
+                self._dirty_users.add(user_id)
             return self._profiles[user_id]
 
     def update(self, user_id: str, **kwargs):
@@ -1396,25 +1554,53 @@ class UserProfileStore:
                 if hasattr(profile, key):
                     setattr(profile, key, value)
             profile.updated_at = time.time()
-            self._dirty = True
+            self._dirty_users.add(user_id)
 
     def save_if_dirty(self):
-        """如果有修改则保存"""
+        """保存有修改的用户画像"""
         with self._lock:
-            if self._dirty:
-                self._save()
+            if not self._dirty_users:
+                return
+            for user_id in self._dirty_users:
+                try:
+                    self._save_profile(user_id)
+                except Exception as e:
+                    logger.error(f"保存用户画像失败 {user_id}: {e}")
+            logger.debug(f"保存 {len(self._dirty_users)} 个用户画像到 SQLite")
+            self._dirty_users.clear()
 
     def flush(self):
-        """强制保存"""
+        """强制保存所有用户画像"""
         with self._lock:
-            self._save()
+            for user_id in self._profiles:
+                try:
+                    self._save_profile(user_id)
+                except Exception as e:
+                    logger.error(f"保存用户画像失败 {user_id}: {e}")
+            self._dirty_users.clear()
+            logger.debug(f"强制保存 {len(self._profiles)} 个用户画像到 SQLite")
+
+    # 兼容旧代码中直接访问 _dirty 的地方
+    @property
+    def _dirty(self):
+        return len(self._dirty_users) > 0
+
+    @_dirty.setter
+    def _dirty(self, value):
+        # 旧代码设置 _dirty = True 时，无法知道是哪个用户
+        # 但这只在 _update_user_context 中使用，那里已经有 user_id
+        # 这里做一个安全的 no-op，实际的 dirty 追踪通过 _dirty_users
+        pass
 
 
 class MemoryManager:
     """记忆管理器"""
 
     # 默认存储路径
-    DEFAULT_STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "memory")
+    DEFAULT_STORAGE_DIR = os.getenv(
+        "MEMORY_STORAGE_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "data", "memory"),
+    )
 
     # 存储后端类型
     BACKEND_MEMORY = "memory"
@@ -1486,8 +1672,9 @@ class MemoryManager:
                 db_path=os.path.join(self.storage_dir, "memory.db"),
                 max_size=100000
             )
-            self._profile_store = UserProfileStore(
-                storage_path=os.path.join(self.storage_dir, "user_profiles.json")
+            self._profile_store = SQLiteProfileStore(
+                db_path=os.path.join(self.storage_dir, "profiles.db"),
+                legacy_json_path=os.path.join(self.storage_dir, "user_profiles.json")
             )
 
         elif backend == self.BACKEND_REDIS:
@@ -1498,8 +1685,9 @@ class MemoryManager:
                 use_redis=True,
                 redis_config=redis_config
             )
-            self._profile_store = UserProfileStore(
-                storage_path=os.path.join(self.storage_dir, "user_profiles.json")
+            self._profile_store = SQLiteProfileStore(
+                db_path=os.path.join(self.storage_dir, "profiles.db"),
+                legacy_json_path=os.path.join(self.storage_dir, "user_profiles.json")
             )
 
         else:
@@ -1509,8 +1697,9 @@ class MemoryManager:
                 max_size=100000,
                 use_redis=False
             )
-            self._profile_store = UserProfileStore(
-                storage_path=os.path.join(self.storage_dir, "user_profiles.json")
+            self._profile_store = SQLiteProfileStore(
+                db_path=os.path.join(self.storage_dir, "profiles.db"),
+                legacy_json_path=os.path.join(self.storage_dir, "user_profiles.json")
             )
 
     # === 短期记忆操作 ===
@@ -1559,12 +1748,17 @@ class MemoryManager:
     def search_long_term(self, user_id: str, query: str,
                          limit: int = 5) -> List[MemoryItem]:
         """搜索长期记忆"""
+        # SQLiteMemoryStore 有专用的 search_by_user 方法
+        if isinstance(self.long_term, SQLiteMemoryStore):
+            return self.long_term.search_by_user(user_id, query, limit)
+        # InMemoryStore 回退到遍历
         results = []
-        for item in self.long_term.store.values():
-            if item.metadata.get("user_id") == user_id:
-                if query.lower() in str(item.content).lower():
-                    results.append(item)
-        results.sort(key=lambda x: (x.importance, x.last_access), reverse=True)
+        if hasattr(self.long_term, 'store'):
+            for item in self.long_term.store.values():
+                if item.metadata.get("user_id") == user_id:
+                    if query.lower() in str(item.content).lower():
+                        results.append(item)
+            results.sort(key=lambda x: (x.importance, x.last_access), reverse=True)
         return results[:limit]
 
     # === 工作记忆操作 ===
@@ -1633,7 +1827,7 @@ class MemoryManager:
                 setattr(profile, key, value)
         profile.updated_at = time.time()
         if self._profile_store:
-            self._profile_store._dirty = True
+            self._profile_store._dirty_users.add(user_id)
 
     def record_interaction(self, user_id: str, interaction_type: str,
                            content: str, metadata: Dict = None):
@@ -1651,7 +1845,7 @@ class MemoryManager:
         profile.total_messages += 1
         profile.updated_at = time.time()
         if self._profile_store:
-            self._profile_store._dirty = True
+            self._profile_store._dirty_users.add(user_id)
 
     # === 对话摘要操作 ===
 
@@ -1857,10 +2051,17 @@ class MemoryManager:
             user_id: 可选，指定用户ID，不指定则清理所有
         """
         # 获取长期记忆
-        all_memories = list(self.long_term.store.values())
-
-        if user_id:
-            all_memories = [m for m in all_memories if m.metadata.get("user_id") == user_id]
+        if isinstance(self.long_term, SQLiteMemoryStore):
+            if user_id:
+                all_memories = self.long_term.search_by_user(user_id, limit=1000)
+            else:
+                all_memories = self.long_term.search("", limit=1000)
+        elif hasattr(self.long_term, 'store'):
+            all_memories = list(self.long_term.store.values())
+            if user_id:
+                all_memories = [m for m in all_memories if m.metadata.get("user_id") == user_id]
+        else:
+            return
 
         if not all_memories:
             return
@@ -1886,10 +2087,15 @@ class MemoryManager:
             user_id: 用户ID
         """
         # 获取用户的长期记忆
-        user_memories = [
-            m for m in self.long_term.store.values()
-            if m.metadata.get("user_id") == user_id
-        ]
+        if isinstance(self.long_term, SQLiteMemoryStore):
+            user_memories = self.long_term.search_by_user(user_id, limit=500)
+        elif hasattr(self.long_term, 'store'):
+            user_memories = [
+                m for m in self.long_term.store.values()
+                if m.metadata.get("user_id") == user_id
+            ]
+        else:
+            return
 
         if len(user_memories) <= 1:
             return
@@ -1922,13 +2128,30 @@ class MemoryManager:
 
         # 2. 合并相似记忆（对每个用户）
         user_ids = set()
-        for mem in self.long_term.store.values():
-            uid = mem.metadata.get("user_id")
-            if uid:
-                user_ids.add(uid)
+        if isinstance(self.long_term, SQLiteMemoryStore):
+            # 从 SQLite 获取所有用户 ID
+            try:
+                with self.long_term._get_connection() as conn:
+                    cursor = conn.execute("SELECT DISTINCT user_id FROM memories WHERE user_id IS NOT NULL")
+                    for row in cursor:
+                        user_ids.add(row[0])
+            except Exception as e:
+                logger.error(f"获取用户列表失败: {e}")
+        elif hasattr(self.long_term, 'store'):
+            for mem in self.long_term.store.values():
+                uid = mem.metadata.get("user_id")
+                if uid:
+                    user_ids.add(uid)
 
         for uid in user_ids:
             self.merge_similar_memories(uid)
+
+        # 3. 过期清理
+        retention_days = getattr(config, "MEMORY_RETENTION_DAYS", 0)
+        if retention_days and hasattr(self.long_term, "prune_older_than"):
+            deleted = self.long_term.prune_older_than(retention_days)
+            if deleted:
+                logger.info(f"已清理过期记忆 {deleted} 条 (>{retention_days}天)")
 
         # 3. 数据库优化（如果是SQLite）
         if isinstance(self.long_term, SQLiteMemoryStore):

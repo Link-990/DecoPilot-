@@ -4,8 +4,10 @@
 """
 import json
 import os
+import re
 import time
 import threading
+import config_data as config
 from typing import Sequence, Optional, Dict
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
@@ -20,6 +22,7 @@ except ImportError:
 
 # 存储后端类型
 STORAGE_BACKEND = os.getenv("HISTORY_STORAGE_BACKEND", "file")  # file / redis
+STORAGE_PATH = getattr(config, "CHAT_HISTORY_DIR", "./chat_history")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
@@ -32,6 +35,7 @@ def get_history(session_id: str) -> BaseChatMessageHistory:
 
     根据环境配置自动选择存储后端
     """
+    session_id = sanitize_session_id(session_id)
     if STORAGE_BACKEND == "redis" and REDIS_AVAILABLE:
         return RedisChatMessageHistory(
             session_id=session_id,
@@ -41,15 +45,26 @@ def get_history(session_id: str) -> BaseChatMessageHistory:
             password=REDIS_PASSWORD,
         )
     else:
-        return FileChatMessageHistory(session_id, "./chat_history")
+        return FileChatMessageHistory(session_id, STORAGE_PATH)
+
+
+def sanitize_session_id(session_id: str) -> str:
+    """将会话ID限制为安全文件名字符，避免路径穿越"""
+    if not session_id:
+        return "session"
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", session_id)
+    return safe[:120] if safe else "session"
 
 
 class FileChatMessageHistory(BaseChatMessageHistory):
     def __init__(self, session_id, storage_path):
-        self.session_id = session_id        # 会话id
+        self.session_id = sanitize_session_id(session_id)        # 会话id
         self.storage_path = storage_path    # 不同会话id的存储文件，所在的文件夹路径
         # 完整的文件路径
-        self.file_path = os.path.join(self.storage_path, self.session_id)
+        base_path = os.path.abspath(self.storage_path)
+        self.file_path = os.path.abspath(os.path.join(base_path, self.session_id))
+        if os.path.commonpath([base_path, self.file_path]) != base_path:
+            raise ValueError("非法会话ID")
 
         # 确保文件夹是存在的
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
@@ -212,9 +227,10 @@ class SessionManager:
 
     def get_session(self, session_id: str) -> BaseChatMessageHistory:
         """获取或创建会话"""
-        if session_id not in self._sessions:
-            self._sessions[session_id] = get_history(session_id)
-        return self._sessions[session_id]
+        safe_id = sanitize_session_id(session_id)
+        if safe_id not in self._sessions:
+            self._sessions[safe_id] = get_history(safe_id)
+        return self._sessions[safe_id]
 
     def list_sessions(self) -> list[str]:
         """列出所有会话 ID"""
@@ -224,7 +240,7 @@ class SessionManager:
             return [k.replace("chat_history:", "") for k in keys]
         else:
             # 从文件系统获取
-            storage_path = "./chat_history"
+            storage_path = STORAGE_PATH
             if os.path.exists(storage_path):
                 return os.listdir(storage_path)
             return []
@@ -234,8 +250,9 @@ class SessionManager:
         try:
             session = self.get_session(session_id)
             session.clear()
-            if session_id in self._sessions:
-                del self._sessions[session_id]
+            safe_id = sanitize_session_id(session_id)
+            if safe_id in self._sessions:
+                del self._sessions[safe_id]
             return True
         except Exception:
             return False
@@ -246,7 +263,7 @@ class SessionManager:
             # Redis 自动处理过期
             return 0
 
-        storage_path = "./chat_history"
+        storage_path = STORAGE_PATH
         if not os.path.exists(storage_path):
             return 0
 

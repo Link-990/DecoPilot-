@@ -59,6 +59,15 @@
     scrollbar-width: thin;
     scrollbar-color: rgb(226 232 240 / 0.6) transparent;
   }
+
+  /* 隐藏浏览器自带的密码眼睛图标 */
+  input::-ms-reveal,
+  input::-ms-clear {
+    display: none;
+  }
+  input::-webkit-credentials-auto-fill-button {
+    display: none !important;
+  }
 }
 
 /* ===== 组件样式 ===== */

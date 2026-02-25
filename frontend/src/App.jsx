@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import rehypeRaw from 'rehype-raw';
 import {
   Send, Bot, User, Brain, Search, Loader2,
   Plus, MessageSquare, Settings, MoreVertical,
@@ -10,9 +9,11 @@ import {
   ChevronDown, ChevronRight, Gift, Building2, Zap, X,
   ImagePlus, Target,
   Square, Pencil, Copy, Check, RefreshCw, ThumbsUp, ThumbsDown,
-  Type, Keyboard, AlertTriangle, Download
+  Type, Keyboard, AlertTriangle, Download, LogOut
 } from 'lucide-react';
 import { StructuredDataRenderer } from './components/StructuredData';
+import LoginPage from './components/LoginPage';
+import ProfilePage from './components/ProfilePage';
 import './index.css';
 
 // 思考过程组件 — 极简内联折叠（左边线+展开）
@@ -99,8 +100,68 @@ const ExpertDebugBlock = React.memo(({ expertInfo, msgId, isExpanded, onToggle }
   );
 });
 
+// ===== 认证包装组件 =====
 function App() {
-  const [userType, setUserType] = useState('c_end');
+  const [isAuthed, setIsAuthed] = useState(() => localStorage.getItem('decopilot_auth') === '1');
+  const [authUser, setAuthUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem('decopilot_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch { return null; }
+  });
+
+  useEffect(() => {
+    if (!isAuthed) return;
+    const verify = async () => {
+      try {
+        const res = await fetch('/api/v1/auth/me', { credentials: 'include', headers: getAuthHeaders() });
+        if (!res.ok) throw new Error('unauthorized');
+        const data = await res.json();
+        if (data?.id) {
+          setAuthUser(data);
+          localStorage.setItem('decopilot_user', JSON.stringify(data));
+          return;
+        }
+        throw new Error('invalid user');
+      } catch {
+        handleLogout();
+      }
+    };
+    verify();
+  }, [isAuthed]);
+
+  const handleLogin = (user) => {
+    setIsAuthed(true);
+    setAuthUser(user);
+    localStorage.setItem('decopilot_auth', '1');
+    localStorage.setItem('decopilot_user', JSON.stringify(user));
+  };
+
+  const handleLogout = () => {
+    setIsAuthed(false);
+    setAuthUser(null);
+    localStorage.removeItem('decopilot_auth');
+    localStorage.removeItem('decopilot_token');
+    localStorage.removeItem('decopilot_user');
+  };
+
+  if (!isAuthed || !authUser) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
+
+  return <ChatApp authUser={authUser} onLogout={handleLogout} />;
+}
+
+// 构建带认证的请求头
+function getAuthHeaders(extra = {}) {
+  const token = localStorage.getItem('decopilot_token');
+  const headers = { 'Content-Type': 'application/json', ...extra };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  return headers;
+}
+
+function ChatApp({ authUser, onLogout }) {
+  const [userType, setUserType] = useState(authUser?.user_type || 'c_end');
   const [showUserTypeMenu, setShowUserTypeMenu] = useState(false);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -112,6 +173,7 @@ function App() {
   const [activeMenuId, setActiveMenuId] = useState(null);
   const [expandedThinking, setExpandedThinking] = useState({});
   const [expandedExpert, setExpandedExpert] = useState({});
+  const [currentView, setCurrentView] = useState('chat'); // 'chat' | 'profile'
   const [history, setHistory] = useState(() => {
     try {
       const saved = localStorage.getItem('decopilot_chat_history');
@@ -150,6 +212,12 @@ function App() {
   const shouldAutoScrollRef = useRef(true);
   const abortControllerRef = useRef(null);  // 终止回答
   const editTextareaRef = useRef(null);     // 编辑框
+
+  const getServerSessionId = (chatId) => {
+    if (!chatId) return null;
+    const item = history.find(h => h.id === chatId);
+    return item?.serverSessionId || null;
+  };
 
   // 通用 textarea 自动高度
   const autoResize = (el, maxHeight = 200) => {
@@ -405,30 +473,38 @@ function App() {
 
     try {
       const activeId = currentChatId;
+      const sessionId = getServerSessionId(activeId);
       const endpoint = userType === 'c_end' ? '/api/v1/chat/c-end' : '/api/v1/chat/b-end';
+      const body = {
+        message: userContent,
+        enable_search: enableSearch,
+        show_thinking: showThinking
+      };
+      if (sessionId) body.session_id = sessionId;
+
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: userContent,
-          session_id: `${userType}_${activeId}`,
-          enable_search: enableSearch,
-          show_thinking: showThinking
-        }),
+        headers: getAuthHeaders(),
+        credentials: 'include',
+        body: JSON.stringify(body),
         signal: controller.signal
       });
 
       if (!response.ok) {
+        const legacyBody = { message: userContent, enable_search: enableSearch, show_thinking: showThinking };
+        if (sessionId) legacyBody.session_id = sessionId;
+
         const legacyResponse = await fetch('/chat_stream', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: userContent, enable_search: enableSearch, show_thinking: showThinking }),
+          headers: getAuthHeaders(),
+          credentials: 'include',
+          body: JSON.stringify(legacyBody),
           signal: controller.signal
         });
         if (!legacyResponse.ok) throw new Error('Server error');
-        await processStream(legacyResponse, newMsgId);
+        await processStream(legacyResponse, newMsgId, activeId);
       } else {
-        await processStream(response, newMsgId);
+        await processStream(response, newMsgId, activeId);
       }
 
       // 生成完成后，将新内容保存到 versions
@@ -583,16 +659,23 @@ function App() {
     showToast('对话已导出');
   };
 
-  const uploadImage = async (file, message = '') => {
+  const uploadImage = async (file, message = '', sessionId = null) => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('message', message);
     formData.append('user_type', userType);
     formData.append('enable_search', enableSearch);
     formData.append('show_thinking', showThinking);
+    if (sessionId) formData.append('session_id', sessionId);
+
+    const token = localStorage.getItem('decopilot_token');
+    const headers = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
 
     const response = await fetch('/api/v1/chat/chat-with-media', {
       method: 'POST',
+      credentials: 'include',
+      headers,
       body: formData
     });
 
@@ -625,14 +708,16 @@ function App() {
       title: firstUserMsg.length > 20 ? firstUserMsg.substring(0, 20) + '...' : firstUserMsg,
       date: new Date().toLocaleDateString('zh-CN'),
       messages: initialMessages,
-      userType
+      userType,
+      serverSessionId: null
     };
     setHistory(prev => [newItem, ...prev]);
     return newId;
   };
 
-  const sendMessage = async (customMessage = null) => {
+  const sendMessage = async (customMessage = null, displayContent = null) => {
     const messageToSend = customMessage || input.trim();
+    const displayMessage = displayContent || messageToSend;
     const hasImage = selectedImage !== null;
 
     if ((!messageToSend && !hasImage) || isLoading) return;
@@ -648,7 +733,7 @@ function App() {
 
     const userMessage = {
       role: 'user',
-      content: messageToSend || '请帮我分析这张图片',
+      content: displayMessage || '请帮我分析这张图片',
       image: hasImage ? imagePreview : null,
       id: `user-${Date.now()}`,
       timestamp: Date.now()
@@ -667,7 +752,7 @@ function App() {
 
     let activeId = currentChatId;
     if (!activeId) {
-      activeId = createHistoryItem(messageToSend || '[图片]', updatedMessages);
+      activeId = createHistoryItem(displayMessage || '[图片]', updatedMessages);
       setCurrentChatId(activeId);
     }
 
@@ -678,34 +763,43 @@ function App() {
     try {
       if (hasImage) {
         setIsUploadingImage(true);
-        const response = await uploadImage(imageToUpload, messageToSend);
+        const sessionId = getServerSessionId(activeId);
+        const response = await uploadImage(imageToUpload, messageToSend, sessionId);
         setIsUploadingImage(false);
-        await processStream(response, newMsgId);
+        await processStream(response, newMsgId, activeId);
       } else {
         const endpoint = userType === 'c_end' ? '/api/v1/chat/c-end' : '/api/v1/chat/b-end';
+        const sessionId = getServerSessionId(activeId);
+        const body = {
+          message: messageToSend,
+          enable_search: enableSearch,
+          show_thinking: showThinking
+        };
+        if (sessionId) body.session_id = sessionId;
+
         const response = await fetch(endpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: messageToSend,
-            session_id: `${userType}_${activeId}`,
-            enable_search: enableSearch,
-            show_thinking: showThinking
-          }),
+          headers: getAuthHeaders(),
+          credentials: 'include',
+          body: JSON.stringify(body),
           signal: controller.signal
         });
 
         if (!response.ok) {
+          const legacyBody = { message: messageToSend, enable_search: enableSearch, show_thinking: showThinking };
+          if (sessionId) legacyBody.session_id = sessionId;
+
           const legacyResponse = await fetch('/chat_stream', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: messageToSend, enable_search: enableSearch, show_thinking: showThinking }),
+            headers: getAuthHeaders(),
+            credentials: 'include',
+            body: JSON.stringify(legacyBody),
             signal: controller.signal
           });
           if (!legacyResponse.ok) throw new Error('Server error');
-          await processStream(legacyResponse, newMsgId);
+          await processStream(legacyResponse, newMsgId, activeId);
         } else {
-          await processStream(response, newMsgId);
+          await processStream(response, newMsgId, activeId);
         }
       }
     } catch (error) {
@@ -740,9 +834,17 @@ function App() {
     'table', 'subsidy_calc', 'merchant_card', 'merchant_list',
     'process_steps', 'checklist', 'comparison', 'sources',
     'quick_replies', 'action_buttons',
+    'research_progress', 'research_report',
   ]);
 
-  const processStream = async (response, newMsgId) => {
+  const normalizeStructuredData = (type, data) => {
+    if (!data) return data;
+    if (type === 'quick_replies' && data.replies) return data.replies;
+    if (type === 'action_buttons' && data.buttons) return data.buttons;
+    return data;
+  };
+
+  const processStream = async (response, newMsgId, activeChatId) => {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -771,10 +873,28 @@ function App() {
             } else if (data.type === 'error') {
               const errMsg = data.data?.message || data.message || '发生未知错误';
               return { ...msg, content: msg.content + `\n\n⚠️ ${errMsg}` };
+            } else if (data.type === 'stream_start') {
+              const sessionId = data.session_id || data.data?.session_id;
+              if (sessionId && activeChatId) {
+                setHistory(prev => prev.map(item =>
+                  item.id === activeChatId ? { ...item, serverSessionId: sessionId } : item
+                ));
+              }
+              return msg;
             } else if (STRUCTURED_TYPES.has(data.type)) {
-              const block = { type: data.type, data: data.data, id: Date.now() + Math.random() };
-              return { ...msg, structuredBlocks: [...(msg.structuredBlocks || []), block] };
-            } else if (data.type === 'stream_start' || data.type === 'stream_end' || data.type === 'meta') {
+              const normalized = normalizeStructuredData(data.type, data.data);
+              const existing = msg.structuredBlocks || [];
+              if (data.type === 'research_progress') {
+                // 研究进度：替换已有的同类型 block（原地更新而非堆叠）
+                const filtered = existing.filter(b => b.type !== 'research_progress');
+                return { ...msg, structuredBlocks: [...filtered, { type: data.type, data: normalized, id: 'research-progress' }] };
+              } else if (data.type === 'research_report') {
+                // 研究报告头部：插到最前面，确保标题在内容之前
+                return { ...msg, structuredBlocks: [{ type: data.type, data: normalized, id: 'research-report' }, ...existing] };
+              }
+              const block = { type: data.type, data: normalized, id: Date.now() + Math.random() };
+              return { ...msg, structuredBlocks: [...existing, block] };
+            } else if (data.type === 'stream_end' || data.type === 'meta') {
               return msg;
             }
             return msg;
@@ -795,8 +915,16 @@ function App() {
           if (data.type === 'answer' || data.type === 'text') {
             return { ...msg, content: msg.content + (data.content || data.data?.content || '') };
           } else if (STRUCTURED_TYPES.has(data.type)) {
-            const block = { type: data.type, data: data.data, id: Date.now() + Math.random() };
-            return { ...msg, structuredBlocks: [...(msg.structuredBlocks || []), block] };
+            const normalized = normalizeStructuredData(data.type, data.data);
+            const existing = msg.structuredBlocks || [];
+            if (data.type === 'research_progress') {
+              const filtered = existing.filter(b => b.type !== 'research_progress');
+              return { ...msg, structuredBlocks: [...filtered, { type: data.type, data: normalized, id: 'research-progress' }] };
+            } else if (data.type === 'research_report') {
+              return { ...msg, structuredBlocks: [{ type: data.type, data: normalized, id: 'research-report' }, ...existing] };
+            }
+            const block = { type: data.type, data: normalized, id: Date.now() + Math.random() };
+            return { ...msg, structuredBlocks: [...existing, block] };
           }
           return msg;
         }));
@@ -1173,14 +1301,30 @@ function App() {
           )}
         </div>
 
-        {/* Settings */}
-        <div className="p-2 border-t border-slate-100/60">
+        {/* User & Settings */}
+        <div className="p-2 border-t border-slate-100/60 space-y-0.5">
+          <button
+            onClick={() => setCurrentView(currentView === 'profile' ? 'chat' : 'profile')}
+            className={`w-full flex items-center gap-2 px-2.5 py-[7px] rounded-md transition-colors text-[13px] ${
+              currentView === 'profile'
+                ? (theme === 'owner' ? 'bg-owner-50 text-owner-600' : 'bg-merchant-50 text-merchant-600')
+                : 'text-slate-400 hover:bg-slate-100/50 hover:text-slate-600'
+            }`}
+          >
+            <FileText size={14} />
+            <span className="flex-1 text-left">我的档案</span>
+          </button>
           <button
             onClick={() => setShowSettings(true)}
             className="w-full flex items-center gap-2 px-2.5 py-[7px] rounded-md text-slate-400 hover:bg-slate-100/50 hover:text-slate-600 transition-colors text-[13px]"
           >
-            <Settings size={15} />
-            <span>设置</span>
+            <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-medium text-white ${
+              userType === 'c_end' ? 'bg-owner-500' : 'bg-merchant-500'
+            }`}>
+              {(authUser?.nickname || authUser?.username || '?')[0].toUpperCase()}
+            </div>
+            <span className="flex-1 text-left truncate text-slate-600">{authUser?.nickname || authUser?.username}</span>
+            <Settings size={14} className="text-slate-300" />
           </button>
         </div>
       </aside>
@@ -1209,6 +1353,10 @@ function App() {
           {isSidebarOpen ? <PanelLeftClose size={17} /> : <PanelLeft size={17} />}
         </button>
 
+        {currentView === 'profile' && (
+          <ProfilePage authUser={authUser} theme={theme} onBack={() => setCurrentView('chat')} />
+        )}
+        <div style={{ display: currentView === 'chat' ? 'contents' : 'none' }}>
         {/* Messages */}
         <div
           ref={messagesContainerRef}
@@ -1381,24 +1529,34 @@ function App() {
 
                       {msg.content || (msg.structuredBlocks && msg.structuredBlocks.length > 0) ? (
                         <>
+                          {/* 研究报告头部和进度条放在文本内容之前 */}
+                          {msg.structuredBlocks && msg.structuredBlocks.filter(b => b.type === 'research_report' || b.type === 'research_progress').map((block) => (
+                            <StructuredDataRenderer
+                              key={block.id}
+                              type={block.type}
+                              data={block.data}
+                              onAction={() => {}}
+                            />
+                          ))}
                           {msg.content && (
                             <ReactMarkdown
                               className="prose-chat"
                               remarkPlugins={[remarkGfm]}
-                              rehypePlugins={[rehypeRaw]}
                               components={markdownComponents}
                             >
                               {processContent(msg.content)}
                             </ReactMarkdown>
                           )}
-                          {msg.structuredBlocks && msg.structuredBlocks.map((block) => (
+                          {msg.structuredBlocks && msg.structuredBlocks.filter(b => b.type !== 'research_report' && b.type !== 'research_progress').map((block) => (
                             <StructuredDataRenderer
                               key={block.id}
                               type={block.type}
                               data={block.data}
                               onAction={(item) => {
                                 if (block.type === 'quick_replies' && item?.text) {
-                                  sendMessage(item.text);
+                                  const payload = item?.payload || item?.text;
+                                  const display = item?.text || payload;
+                                  sendMessage(payload, display);
                                 }
                               }}
                             />
@@ -1666,6 +1824,7 @@ function App() {
             </p>
           </div>
         </div>
+        </div>
       </main>
 
       {/* ===== 设置面板抽屉 ===== */}
@@ -1689,6 +1848,36 @@ function App() {
 
             {/* 内容 */}
             <div className="flex-1 overflow-y-auto p-5 space-y-6">
+              {/* 账号信息 */}
+              <div>
+                <h3 className="text-[13px] font-semibold text-slate-500 uppercase tracking-wider mb-3">账号</h3>
+                <div className="flex items-center gap-3 p-3 rounded-xl bg-slate-50 border border-slate-100">
+                  <div className={`w-10 h-10 rounded-full flex items-center justify-center text-[15px] font-semibold text-white flex-shrink-0 ${
+                    userType === 'c_end' ? 'bg-owner-500' : 'bg-merchant-500'
+                  }`}>
+                    {(authUser?.nickname || authUser?.username || '?')[0].toUpperCase()}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[14px] font-medium text-slate-700 truncate">{authUser?.nickname || authUser?.username}</div>
+                    <div className="text-[12px] text-slate-400 truncate">
+                      {authUser?.nickname ? `@${authUser.username}` : ''}{authUser?.city ? ` · ${authUser.city}` : ''}
+                    </div>
+                  </div>
+                  <span className={`text-[11px] px-2 py-0.5 rounded-full font-medium ${
+                    userType === 'c_end' ? 'bg-owner-50 text-owner-500' : 'bg-merchant-50 text-merchant-500'
+                  }`}>
+                    {userType === 'c_end' ? '业主' : '商家'}
+                  </span>
+                </div>
+                <button
+                  onClick={() => { setShowSettings(false); onLogout(); }}
+                  className="flex items-center gap-2 mt-2 px-3 py-2 rounded-lg text-[13px] text-red-400 hover:text-red-500 hover:bg-red-50 transition-colors w-full"
+                >
+                  <LogOut size={14} />
+                  <span>退出登录</span>
+                </button>
+              </div>
+
               {/* 对话设置 */}
               <div>
                 <h3 className="text-[13px] font-semibold text-slate-500 uppercase tracking-wider mb-3">对话设置</h3>

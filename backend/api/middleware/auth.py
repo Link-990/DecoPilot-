@@ -7,11 +7,18 @@ import sys
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import HTTPException, Security, Depends
+from fastapi import HTTPException, Security, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 import config_data as config
+
+try:
+    from backend.core.logging_config import get_logger
+    logger = get_logger("auth")
+except ImportError:
+    import logging
+    logger = logging.getLogger("auth")
 
 try:
     from jose import JWTError, jwt
@@ -20,6 +27,20 @@ except ImportError:
     JWT_AVAILABLE = False
 
 security = HTTPBearer(auto_error=False)
+
+
+def _ensure_jwt_ready() -> None:
+    """检查JWT运行时可用性与安全配置"""
+    if not JWT_AVAILABLE:
+        if config.ENV == "development" and config.ALLOW_DEV_AUTH_BYPASS:
+            return
+        raise HTTPException(status_code=500, detail="JWT支持未安装")
+
+    if config.ENV == "production":
+        if config.JWT_SECRET_KEY == "your-secret-key-change-in-production":
+            raise HTTPException(status_code=500, detail="JWT密钥未配置")
+        if config.ALLOW_DEV_AUTH_BYPASS:
+            logger.warning("生产环境检测到 ALLOW_DEV_AUTH_BYPASS=true，已强制忽略")
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -33,8 +54,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     Returns:
         JWT令牌字符串
     """
-    if not JWT_AVAILABLE:
-        raise HTTPException(status_code=500, detail="JWT支持未安装")
+    _ensure_jwt_ready()
 
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=config.ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -43,7 +63,10 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt.encode(to_encode, config.JWT_SECRET_KEY, algorithm=config.JWT_ALGORITHM)
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> dict:
+def verify_token(
+    request: Request = None,
+    credentials: HTTPAuthorizationCredentials = Security(security),
+) -> dict:
     """
     验证JWT令牌
 
@@ -57,20 +80,39 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
         HTTPException: 认证失败时抛出
     """
     if not JWT_AVAILABLE:
-        # JWT未安装时，跳过认证（开发模式）
-        return {"user_id": "dev_user", "user_type": "both"}
+        if config.ENV == "development" and config.ALLOW_DEV_AUTH_BYPASS:
+            logger.debug("JWT 不可用，开发旁路返回 dev_user")
+            return {"user_id": "dev_user", "user_type": "both"}
+        raise HTTPException(status_code=500, detail="JWT支持未安装")
 
-    if credentials is None:
+    _ensure_jwt_ready()
+
+    # 优先使用 Authorization header，其次使用 Cookie
+    token = None
+    token_source = None
+
+    if credentials is not None:
+        token = credentials.credentials
+        token_source = "Authorization header"
+    elif request is not None:
+        token = request.cookies.get("access_token")
+        if token:
+            token_source = "Cookie"
+
+    if not token:
+        logger.debug("认证失败：未找到 token（无 Authorization header 且无 Cookie）")
         raise HTTPException(status_code=401, detail="未提供认证令牌")
 
     try:
         payload = jwt.decode(
-            credentials.credentials,
+            token,
             config.JWT_SECRET_KEY,
             algorithms=[config.JWT_ALGORITHM]
         )
+        logger.debug(f"认证成功 via {token_source}, user_id={payload.get('user_id')}")
         return payload
     except JWTError as e:
+        logger.debug(f"令牌验证失败 via {token_source}: {e}")
         raise HTTPException(status_code=401, detail=f"令牌验证失败: {str(e)}")
 
 

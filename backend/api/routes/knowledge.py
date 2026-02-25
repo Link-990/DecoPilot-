@@ -4,14 +4,17 @@
 """
 import os
 import sys
+import tempfile
 from typing import Optional, List
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from backend.knowledge.multi_collection_kb import MultiCollectionKB
+from backend.api.middleware.auth import get_current_user
+import config_data as config
 
 # 导入异步工具
 try:
@@ -20,7 +23,26 @@ try:
 except ImportError:
     ASYNC_UTILS_AVAILABLE = False
 
-router = APIRouter(prefix="/knowledge", tags=["知识库"])
+router = APIRouter(prefix="/knowledge", tags=["知识库"], dependencies=[Depends(get_current_user)])
+
+MAX_UPLOAD_BYTES = getattr(config, "MAX_UPLOAD_BYTES", 10 * 1024 * 1024)
+
+
+async def _save_upload_to_temp(file: UploadFile, suffix: str) -> str:
+    """将上传文件流式写入临时文件，并进行大小限制"""
+    size = 0
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                tmp.close()
+                os.unlink(tmp.name)
+                raise HTTPException(status_code=413, detail="文件过大，已拒绝上传")
+            tmp.write(chunk)
+        return tmp.name
 
 
 class AddTextRequest(BaseModel):
@@ -165,12 +187,8 @@ async def upload_file(
     keyword_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else None
 
     if filename.endswith(".pdf"):
-        # 保存临时文件
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+        # 保存临时文件（含大小限制）
+        tmp_path = await _save_upload_to_temp(file, ".pdf")
 
         try:
             # 使用线程池执行阻塞操作
@@ -201,9 +219,14 @@ async def upload_file(
         finally:
             os.unlink(tmp_path)
     else:
-        # 处理文本文件
-        content = await file.read()
-        text = content.decode("utf-8")
+        # 处理文本文件（含大小限制）
+        tmp_path = await _save_upload_to_temp(file, ".txt")
+        try:
+            with open(tmp_path, "rb") as f:
+                content = f.read()
+            text = content.decode("utf-8", errors="replace")
+        finally:
+            os.unlink(tmp_path)
 
         # 使用线程池执行阻塞操作
         if ASYNC_UTILS_AVAILABLE:

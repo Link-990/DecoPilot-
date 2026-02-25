@@ -5,20 +5,21 @@
 import os
 import sys
 import json
-import base64
 import tempfile
 import time
+import uuid
+import asyncio
 from typing import Optional, List
 
-from fastapi import APIRouter, Request, Depends, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from backend.agents.c_end_agent import CEndAgent
 from backend.agents.b_end_agent import BEndAgent
-from backend.api.middleware.auth import get_current_user, require_user_type
+from backend.api.middleware.auth import get_current_user
 from backend.core.output_formatter import (
     OutputFormatter, OutputType, Source,
     QuickReply, create_decoration_process
@@ -28,15 +29,16 @@ from backend.core.multimodal import (
     ImageAnalysisType, ImageAnalysisResult
 )
 from rag import RagService
+import config_data as config
 
 router = APIRouter(prefix="/chat", tags=["聊天"])
 
 
 class ChatRequest(BaseModel):
     """聊天请求模型"""
-    message: str
-    session_id: Optional[str] = None
-    user_type: Optional[str] = "both"
+    message: str = Field(..., min_length=1, max_length=5000, description="用户消息")
+    session_id: Optional[str] = Field(None, max_length=100)
+    user_type: Optional[str] = Field("both", pattern=r"^(c_end|b_end|both)$")
     enable_search: bool = True
     show_thinking: bool = True
     user_context: Optional[dict] = None
@@ -47,6 +49,57 @@ class ChatResponse(BaseModel):
     answer: str
     thinking_log: Optional[list] = None
     session_id: str
+
+
+# === 用户类型与鉴权辅助 ===
+
+def _resolve_user_type(request_user_type: Optional[str], current_user: dict) -> str:
+    token_type = current_user.get("user_type") if current_user else None
+    if token_type in ("c_end", "b_end"):
+        return token_type
+    if token_type == "both" or token_type is None:
+        return request_user_type or "both"
+    return request_user_type or "both"
+
+
+def _enforce_user_type(current_user: dict, allowed: set) -> None:
+    token_type = current_user.get("user_type") if current_user else None
+    if token_type in ("both", None):
+        return
+    if token_type not in allowed:
+        raise HTTPException(status_code=403, detail="用户类型无权限访问该接口")
+
+
+def _normalize_session_id(session_id: Optional[str], user_id: str) -> str:
+    if session_id and session_id.startswith(f"{user_id}_"):
+        return session_id
+    return f"{user_id}_{uuid.uuid4().hex[:8]}"
+
+
+MAX_UPLOAD_BYTES = getattr(config, "MAX_UPLOAD_BYTES", 10 * 1024 * 1024)
+ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".txt", ".docx", ".md", ".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+async def _read_upload_with_limit(file: UploadFile) -> bytes:
+    """读取上传文件并限制大小和类型"""
+    # 校验文件扩展名
+    if file.filename:
+        from pathlib import Path
+        ext = Path(file.filename).suffix.lower()
+        if ext and ext not in ALLOWED_UPLOAD_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
+
+    size = 0
+    chunks = []
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="文件过大，已拒绝上传")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # 初始化智能体（延迟加载）
@@ -77,14 +130,15 @@ def get_rag_service(user_type: str = "both"):
 
 
 @router.post("/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: ChatRequest, current_user: dict = Depends(get_current_user)):
     """
     通用聊天流式接口
 
     根据user_type自动路由到对应的智能体
     """
-    user_type = request.user_type or "both"
-    session_id = request.session_id or f"user_{user_type}_001"
+    user_type = _resolve_user_type(request.user_type, current_user)
+    user_id = current_user.get("user_id")
+    session_id = _normalize_session_id(request.session_id, user_id)
 
     # 创建输出格式化器
     formatter = OutputFormatter(session_id, user_type)
@@ -108,39 +162,42 @@ async def chat_stream(request: ChatRequest):
             input_data = {"input": request.message}
 
             try:
-                async for event in rag.chain.astream_events(input_data, session_config, version="v1"):
-                    kind = event["event"]
+                async with asyncio.timeout(120):
+                    async for event in rag.chain.astream_events(input_data, session_config, version="v1"):
+                        kind = event["event"]
 
-                    if kind == "on_retriever_end":
-                        if "output" in event["data"]:
-                            docs = event["data"]["output"]
-                            if docs:
-                                # 输出思考过程
-                                if hasattr(docs[0], "metadata") and "thinking_log" in docs[0].metadata:
-                                    logs = docs[0].metadata["thinking_log"]
-                                    yield formatter.thinking(logs)
+                        if kind == "on_retriever_end":
+                            if "output" in event["data"]:
+                                docs = event["data"]["output"]
+                                if docs:
+                                    # 输出思考过程
+                                    if hasattr(docs[0], "metadata") and "thinking_log" in docs[0].metadata:
+                                        logs = docs[0].metadata["thinking_log"]
+                                        yield formatter.thinking(logs)
 
-                                # 输出引用来源
-                                sources = []
-                                for doc in docs[:3]:  # 最多3个来源
-                                    if hasattr(doc, "metadata"):
-                                        sources.append(Source(
-                                            title=doc.metadata.get("source", "未知来源"),
-                                            content=doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
-                                            collection=doc.metadata.get("collection", "unknown"),
-                                            relevance_score=doc.metadata.get("score", 0.0),
-                                        ))
-                                if sources:
-                                    yield formatter.sources(sources)
+                                    # 输出引用来源
+                                    sources = []
+                                    for doc in docs[:3]:  # 最多3个来源
+                                        if hasattr(doc, "metadata"):
+                                            sources.append(Source(
+                                                title=doc.metadata.get("source", "未知来源"),
+                                                content=doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                                                collection=doc.metadata.get("collection", "unknown"),
+                                                relevance_score=doc.metadata.get("score", 0.0),
+                                            ))
+                                    if sources:
+                                        yield formatter.sources(sources)
 
-                    elif kind == "on_chat_model_stream":
-                        chunk = event["data"]["chunk"]
-                        if hasattr(chunk, "content") and chunk.content:
-                            yield formatter.answer(chunk.content)
+                        elif kind == "on_chat_model_stream":
+                            chunk = event["data"]["chunk"]
+                            if hasattr(chunk, "content") and chunk.content:
+                                yield formatter.answer(chunk.content)
 
                 # 发送流结束标记
                 yield formatter.stream_end()
 
+            except asyncio.TimeoutError:
+                yield formatter.error("响应超时，请稍后重试", "TIMEOUT_ERROR")
             except Exception as e:
                 yield formatter.error(str(e), "STREAM_ERROR")
                 yield formatter.stream_end()
@@ -153,9 +210,13 @@ async def chat_stream(request: ChatRequest):
 
     async def agent_event_generator():
         try:
-            async for event in agent.process(request.message, session_id):
-                yield event
+            async with asyncio.timeout(120):
+                async for event in agent.process(request.message, session_id, user_id=user_id):
+                    yield event
 
+        except asyncio.TimeoutError:
+            yield formatter.error("响应超时，请稍后重试", "TIMEOUT_ERROR")
+            yield formatter.stream_end()
         except Exception as e:
             yield formatter.error(str(e), "AGENT_ERROR")
             yield formatter.stream_end()
@@ -164,25 +225,27 @@ async def chat_stream(request: ChatRequest):
 
 
 @router.post("/c-end")
-async def chat_c_end(request: ChatRequest):
+async def chat_c_end(request: ChatRequest, current_user: dict = Depends(get_current_user)):
     """
     C端专用聊天接口
 
     面向业主用户，提供装修咨询、补贴政策、商家推荐等服务
     """
+    _enforce_user_type(current_user, {"c_end"})
     request.user_type = "c_end"
-    return await chat_stream(request)
+    return await chat_stream(request, current_user)
 
 
 @router.post("/b-end")
-async def chat_b_end(request: ChatRequest):
+async def chat_b_end(request: ChatRequest, current_user: dict = Depends(get_current_user)):
     """
     B端专用聊天接口
 
     面向商家用户，提供入驻指导、数据产品咨询、获客策略等服务
     """
+    _enforce_user_type(current_user, {"b_end"})
     request.user_type = "b_end"
-    return await chat_stream(request)
+    return await chat_stream(request, current_user)
 
 
 @router.post("/analyze-image")
@@ -192,6 +255,7 @@ async def analyze_image(
     analysis_type: str = Form("style"),
     session_id: Optional[str] = Form(None),
     user_type: str = Form("c_end"),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     图片分析接口
@@ -210,8 +274,9 @@ async def analyze_image(
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="仅支持图片文件")
 
-    # 读取图片内容
-    image_data = await file.read()
+    # 读取图片内容（含大小限制）
+    user_type = _resolve_user_type(user_type, current_user)
+    image_data = await _read_upload_with_limit(file)
 
     # 获取多模态管理器
     mm_manager = get_multimodal_manager()
@@ -270,6 +335,7 @@ async def analyze_document(
     message: str = Form(""),
     session_id: Optional[str] = Form(None),
     user_type: str = Form("c_end"),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     文档分析接口
@@ -282,8 +348,9 @@ async def analyze_document(
     if not (filename.endswith(".pdf") or filename.endswith(".txt")):
         raise HTTPException(status_code=400, detail="仅支持 PDF 和 TXT 文件")
 
-    # 读取文件内容
-    content = await file.read()
+    # 读取文件内容（含大小限制）
+    user_type = _resolve_user_type(user_type, current_user)
+    content = await _read_upload_with_limit(file)
 
     # 获取多模态管理器
     mm_manager = get_multimodal_manager()
@@ -334,6 +401,7 @@ async def chat_with_media(
     user_type: str = Form("c_end"),
     enable_search: bool = Form(True),
     show_thinking: bool = Form(True),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     带媒体文件的聊天接口
@@ -348,10 +416,14 @@ async def chat_with_media(
     content_type = file.content_type or ""
     filename = file.filename.lower() if file.filename else ""
 
+    # 统一用户类型
+    user_type = _resolve_user_type(user_type, current_user)
+    user_id = current_user.get("user_id")
+
     # 判断文件类型
     if content_type.startswith("image/"):
         # 图片分析
-        file_content = await file.read()
+        file_content = await _read_upload_with_limit(file)
 
         # 获取多模态管理器
         mm_manager = get_multimodal_manager()
@@ -404,19 +476,22 @@ async def chat_with_media(
         agent.show_thinking = show_thinking
 
         # 使用智能体处理（流式响应）
-        active_id = session_id or f"{user_type}_{int(time.time())}"
+        active_id = _normalize_session_id(session_id, user_id)
 
         async def agent_stream():
             try:
-                async for event in agent.process(enhanced_message, active_id):
-                    yield event
+                async with asyncio.timeout(120):
+                    async for event in agent.process(enhanced_message, active_id, user_id=user_id):
+                        yield event
+            except asyncio.TimeoutError:
+                yield json.dumps({"type": "error", "content": "响应超时，请稍后重试"}, ensure_ascii=False) + "\n"
             except Exception as e:
                 yield json.dumps({"type": "error", "content": str(e)}, ensure_ascii=False) + "\n"
 
         return StreamingResponse(agent_stream(), media_type="application/x-ndjson")
     elif filename.endswith(".pdf") or filename.endswith(".txt"):
         # 文档分析
-        file_content = await file.read()
+        file_content = await _read_upload_with_limit(file)
 
         # 获取多模态管理器
         mm_manager = get_multimodal_manager()
@@ -487,12 +562,15 @@ async def chat_with_media(
         agent.show_thinking = show_thinking
 
         # 使用智能体处理（流式响应）
-        active_id = session_id or f"{user_type}_{int(time.time())}"
+        active_id = _normalize_session_id(session_id, user_id)
 
         async def agent_stream():
             try:
-                async for event in agent.process(enhanced_message, active_id):
-                    yield event
+                async with asyncio.timeout(120):
+                    async for event in agent.process(enhanced_message, active_id, user_id=user_id):
+                        yield event
+            except asyncio.TimeoutError:
+                yield json.dumps({"type": "error", "content": "响应超时，请稍后重试"}, ensure_ascii=False) + "\n"
             except Exception as e:
                 yield json.dumps({"type": "error", "content": str(e)}, ensure_ascii=False) + "\n"
 
