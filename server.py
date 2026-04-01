@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import uuid
+import asyncio
 from typing import List
 from contextlib import asynccontextmanager
 
@@ -66,21 +67,53 @@ except ImportError as e:
     NEW_API_AVAILABLE = False
     SLOWAPI_AVAILABLE = False
 
+# 导入用户认证路由
+try:
+    from backend.api.routes.auth import router as auth_router
+    AUTH_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"认证模块导入失败: {e}")
+    AUTH_AVAILABLE = False
+
+# 导入用户档案路由
+try:
+    from backend.api.routes.profile import router as profile_router
+    PROFILE_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"档案模块导入失败: {e}")
+    PROFILE_AVAILABLE = False
+
 
 # === 环境配置 ===
 
 # 运行环境
 ENV = os.getenv("ENV", "development")  # development / production
-DEBUG = os.getenv("DEBUG", "true").lower() == "true"
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+# 读取配置模块（用于保留期等）
+try:
+    import config_data as config
+except Exception:
+    config = None
 
 # CORS 配置
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
-if ENV == "production" and CORS_ORIGINS == ["*"]:
-    # 生产环境默认只允许同源
+_cors_raw = os.getenv("CORS_ORIGINS", "").strip()
+if _cors_raw and _cors_raw != "*":
+    CORS_ORIGINS = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+elif ENV == "production":
+    # 生产环境必须显式配置 CORS_ORIGINS
     CORS_ORIGINS = []
+    logger.warning("生产环境未配置 CORS_ORIGINS，将仅允许同源请求")
+else:
+    # 开发环境默认允许本地前端
+    CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173"]
 
 # 可信主机
 TRUSTED_HOSTS = os.getenv("TRUSTED_HOSTS", "*").split(",")
+
+# 生产环境必须启用限流依赖
+if ENV == "production" and NEW_API_AVAILABLE and not SLOWAPI_AVAILABLE:
+    raise RuntimeError("生产环境必须安装 slowapi 以启用限流")
 
 
 # === 性能监控 ===
@@ -238,8 +271,10 @@ app = FastAPI(
 if NEW_API_AVAILABLE and SLOWAPI_AVAILABLE and limiter:
     from slowapi import _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
+    from slowapi.middleware import SlowAPIMiddleware
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
 
 # 可信主机中间件（生产环境）
 if ENV == "production" and TRUSTED_HOSTS != ["*"]:
@@ -251,10 +286,10 @@ if ENV == "production" and TRUSTED_HOSTS != ["*"]:
 # CORS 中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True if CORS_ORIGINS != ["*"] else False,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["*", "Authorization"],
     max_age=600,  # 预检请求缓存10分钟
 )
 
@@ -284,6 +319,19 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # === 请求验证中间件 ===
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """添加安全响应头"""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if ENV == "production":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+    return response
 
 @app.middleware("http")
 async def validate_request(request: Request, call_next):
@@ -386,6 +434,12 @@ if NEW_API_AVAILABLE:
     app.include_router(knowledge_router, prefix="/api/v1")
     app.include_router(merchant_router, prefix="/api/v1")
 
+if AUTH_AVAILABLE:
+    app.include_router(auth_router, prefix="/api/v1")
+
+if PROFILE_AVAILABLE:
+    app.include_router(profile_router, prefix="/api/v1")
+
 
 # === 初始化 RAG 服务 ===
 
@@ -411,32 +465,58 @@ async def chat_stream(request: Request):
     if not message:
         raise HTTPException(status_code=400, detail="message 字段不能为空")
 
+    # 认证：必须携带有效 JWT
+    auth_header = request.headers.get("authorization", "")
+    token = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    else:
+        token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="未提供认证令牌")
+    try:
+        from backend.api.middleware.auth import verify_token
+        from fastapi.security import HTTPAuthorizationCredentials
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        token_data = verify_token(credentials=creds)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="认证失败")
+
+    user_id = token_data.get("user_id")
+    user_type = token_data.get("user_type", "both")
+
     rag_service = get_rag_service()
     rag_service.enable_search = data.get("enable_search", True)
     rag_service.show_thinking = data.get("show_thinking", True)
 
     async def event_generator():
-        session_config = {"configurable": {"session_id": "user_react_001"}}
+        session_id = data.get("session_id") or f"{user_id}_{uuid.uuid4().hex[:8]}"
+        session_config = {"configurable": {"session_id": session_id}}
         input_data = {"input": message}
 
         try:
-            async for event in rag_service.chain.astream_events(input_data, session_config, version="v1"):
-                kind = event["event"]
+            async with asyncio.timeout(120):
+                async for event in rag_service.chain.astream_events(input_data, session_config, version="v1"):
+                    kind = event["event"]
 
-                if kind == "on_retriever_end":
-                    if "output" in event["data"]:
-                        docs = event["data"]["output"]
-                        if docs:
-                            first_doc = docs[0]
-                            if hasattr(first_doc, "metadata") and "thinking_log" in first_doc.metadata:
-                                logs = first_doc.metadata["thinking_log"]
-                                yield json.dumps({"type": "thinking", "content": logs}, ensure_ascii=False) + "\n"
+                    if kind == "on_retriever_end":
+                        if "output" in event["data"]:
+                            docs = event["data"]["output"]
+                            if docs:
+                                first_doc = docs[0]
+                                if hasattr(first_doc, "metadata") and "thinking_log" in first_doc.metadata:
+                                    logs = first_doc.metadata["thinking_log"]
+                                    yield json.dumps({"type": "thinking", "content": logs}, ensure_ascii=False) + "\n"
 
-                elif kind == "on_chat_model_stream":
-                    chunk = event["data"]["chunk"]
-                    if hasattr(chunk, "content") and chunk.content:
-                        yield json.dumps({"type": "answer", "content": chunk.content}, ensure_ascii=False) + "\n"
+                    elif kind == "on_chat_model_stream":
+                        chunk = event["data"]["chunk"]
+                        if hasattr(chunk, "content") and chunk.content:
+                            yield json.dumps({"type": "answer", "content": chunk.content}, ensure_ascii=False) + "\n"
 
+        except asyncio.TimeoutError:
+            yield json.dumps({"type": "error", "content": "响应超时，请稍后重试"}, ensure_ascii=False) + "\n"
         except Exception as e:
             logger.error(f"聊天流异常: {e}", exc_info=True)
             yield json.dumps({"type": "error", "content": str(e)}, ensure_ascii=False) + "\n"
@@ -455,6 +535,11 @@ async def root():
         "env": ENV,
         "description": "家居行业智能体API服务",
         "endpoints": {
+            "auth": {
+                "/api/v1/auth/register": "用户注册",
+                "/api/v1/auth/login": "用户登录",
+                "/api/v1/auth/me": "获取/更新用户信息",
+            },
             "legacy": {
                 "/chat_stream": "原有聊天接口（向后兼容）",
             },
@@ -475,13 +560,40 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """健康检查接口"""
-    return {
-        "status": "healthy",
-        "service": "DecoPilot",
-        "version": "2.0.0",
-        "env": ENV,
-    }
+    """健康检查接口 — 检查关键依赖连通性"""
+    checks = {}
+    overall = "healthy"
+
+    # 检查 ChromaDB（复用已有实例，避免重复打开）
+    try:
+        from backend.core.singleton import get_knowledge_base
+        kb = get_knowledge_base()
+        if hasattr(kb, 'client') and kb.client:
+            kb.client.heartbeat()
+        checks["chromadb"] = "ok"
+    except Exception as e:
+        checks["chromadb"] = f"error: {str(e)}"
+        overall = "unhealthy"
+
+    # 检查 DashScope API Key 是否配置
+    if os.getenv("DASHSCOPE_API_KEY"):
+        checks["dashscope_key"] = "configured"
+    else:
+        checks["dashscope_key"] = "missing"
+        overall = "degraded"
+
+    status_code = 200 if overall != "unhealthy" else 503
+    from fastapi.responses import JSONResponse as _JSONResponse
+    return _JSONResponse(
+        status_code=status_code,
+        content={
+            "status": overall,
+            "service": "DecoPilot",
+            "version": "2.0.0",
+            "env": ENV,
+            "checks": checks,
+        }
+    )
 
 
 @app.get("/metrics")

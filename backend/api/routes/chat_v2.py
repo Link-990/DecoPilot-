@@ -9,9 +9,10 @@ import os
 import sys
 import json
 import time
+import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -22,8 +23,32 @@ from backend.framework.integration import (
     FrameworkChatAdapter,
 )
 from backend.framework.integration.api_adapter import ChatContext
+from backend.api.middleware.auth import get_current_user
 
 router = APIRouter(prefix="/chat/v2", tags=["聊天V2"])
+
+
+def _resolve_user_type(request_user_type: Optional[str], current_user: dict) -> str:
+    token_type = current_user.get("user_type") if current_user else None
+    if token_type in ("c_end", "b_end"):
+        return token_type
+    if token_type == "both" or token_type is None:
+        return request_user_type or "c_end"
+    return request_user_type or "c_end"
+
+
+def _enforce_user_type(current_user: dict, allowed: set) -> None:
+    token_type = current_user.get("user_type") if current_user else None
+    if token_type in ("both", None):
+        return
+    if token_type not in allowed:
+        raise HTTPException(status_code=403, detail="用户类型无权限访问该接口")
+
+
+def _normalize_session_id(session_id: Optional[str], user_id: str) -> str:
+    if session_id and session_id.startswith(f"{user_id}_"):
+        return session_id
+    return f"{user_id}_{uuid.uuid4().hex[:8]}"
 
 
 class ChatRequestV2(BaseModel):
@@ -61,7 +86,7 @@ async def get_adapter() -> FrameworkChatAdapter:
 
 
 @router.post("/stream")
-async def chat_stream_v2(request: ChatRequestV2):
+async def chat_stream_v2(request: ChatRequestV2, current_user: dict = Depends(get_current_user)):
     """
     流式聊天接口 V2
 
@@ -70,10 +95,11 @@ async def chat_stream_v2(request: ChatRequestV2):
     adapter = await get_adapter()
 
     # 构建上下文
+    user_type = _resolve_user_type(request.user_type, current_user)
     context = ChatContext(
-        session_id=request.session_id or f"session_{int(time.time())}",
-        user_id=request.user_id or f"user_{int(time.time())}",
-        user_type=request.user_type or "c_end",
+        session_id=_normalize_session_id(request.session_id, current_user.get("user_id")),
+        user_id=current_user.get("user_id"),
+        user_type=user_type,
         enable_search=request.enable_search,
         show_thinking=request.show_thinking,
         user_context=request.user_context,
@@ -87,29 +113,31 @@ async def chat_stream_v2(request: ChatRequestV2):
 
 
 @router.post("/c-end")
-async def chat_c_end_v2(request: ChatRequestV2):
+async def chat_c_end_v2(request: ChatRequestV2, current_user: dict = Depends(get_current_user)):
     """
     C端专用聊天接口 V2
 
     面向业主用户，提供装修咨询、补贴政策、商家推荐等服务
     """
+    _enforce_user_type(current_user, {"c_end"})
     request.user_type = "c_end"
-    return await chat_stream_v2(request)
+    return await chat_stream_v2(request, current_user)
 
 
 @router.post("/b-end")
-async def chat_b_end_v2(request: ChatRequestV2):
+async def chat_b_end_v2(request: ChatRequestV2, current_user: dict = Depends(get_current_user)):
     """
     B端专用聊天接口 V2
 
     面向商家用户，提供入驻指导、数据产品咨询、获客策略等服务
     """
+    _enforce_user_type(current_user, {"b_end"})
     request.user_type = "b_end"
-    return await chat_stream_v2(request)
+    return await chat_stream_v2(request, current_user)
 
 
 @router.post("/sync")
-async def chat_sync(request: ChatRequestV2):
+async def chat_sync(request: ChatRequestV2, current_user: dict = Depends(get_current_user)):
     """
     非流式聊天接口
 
@@ -118,10 +146,11 @@ async def chat_sync(request: ChatRequestV2):
     adapter = await get_adapter()
 
     # 构建上下文
+    user_type = _resolve_user_type(request.user_type, current_user)
     context = ChatContext(
-        session_id=request.session_id or f"session_{int(time.time())}",
-        user_id=request.user_id or f"user_{int(time.time())}",
-        user_type=request.user_type or "c_end",
+        session_id=_normalize_session_id(request.session_id, current_user.get("user_id")),
+        user_id=current_user.get("user_id"),
+        user_type=user_type,
         enable_search=request.enable_search,
         show_thinking=request.show_thinking,
         user_context=request.user_context,
@@ -132,7 +161,7 @@ async def chat_sync(request: ChatRequestV2):
 
 
 @router.post("/tool")
-async def call_tool(request: ToolCallRequest):
+async def call_tool(request: ToolCallRequest, current_user: dict = Depends(get_current_user)):
     """
     工具调用接口
 
@@ -140,17 +169,18 @@ async def call_tool(request: ToolCallRequest):
     """
     adapter = await get_adapter()
 
+    user_type = _resolve_user_type(request.user_type, current_user)
     result = await adapter.call_tool(
         tool_name=request.tool_name,
         params=request.params,
-        user_type=request.user_type,
+        user_type=user_type,
     )
 
     return result
 
 
 @router.get("/tools")
-async def list_tools(user_type: str = "c_end"):
+async def list_tools(user_type: str = "c_end", current_user: dict = Depends(get_current_user)):
     """
     列出可用工具
 
@@ -159,13 +189,14 @@ async def list_tools(user_type: str = "c_end"):
     adapter = await get_adapter()
 
     # 获取智能体
-    agent = await adapter._get_agent(user_type)
+    effective_user_type = _resolve_user_type(user_type, current_user)
+    agent = await adapter._get_agent(effective_user_type)
 
     # 获取工具列表
     tools = agent.list_tools()
 
     return {
-        "user_type": user_type,
+        "user_type": effective_user_type,
         "tools": [
             {
                 "name": t.name,

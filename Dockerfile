@@ -30,8 +30,14 @@ COPY . .
 # 创建数据目录
 RUN mkdir -p /app/data /app/logs
 
+# 创建非特权用户
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
 # 设置权限
-RUN chmod -R 755 /app
+RUN chown -R appuser:appuser /app && chmod -R 755 /app
+
+# 切换到非特权用户
+USER appuser
 
 # 暴露端口
 EXPOSE 8000

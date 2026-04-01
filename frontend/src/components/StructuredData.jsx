@@ -7,7 +7,8 @@ import {
   Calculator, Store, ListChecks, Table, Quote,
   AlertCircle, Brain, TrendingUp, CheckCircle, XCircle,
   ArrowRight, Clock, DollarSign, BarChart3, Lightbulb,
-  ChevronDown, Star, MapPin, Tag
+  ChevronDown, Star, MapPin, Tag,
+  FileSearch, BookOpen
 } from 'lucide-react';
 
 // 通用卡片容器 — 无边框，背景对比
@@ -653,6 +654,91 @@ export function ErrorMessage({ errors }) {
 }
 
 /**
+ * 研究进度组件 — 5 步进度条
+ */
+export function ResearchProgress({ data }) {
+  if (!data) return null;
+
+  const steps = ['理解需求', '收集信息', '专业分析', '撰写报告', '完成'];
+  const currentStep = data.step || 1;
+  const total = data.total || steps.length;
+
+  return (
+    <div className="my-4 animate-fade-in-up">
+      <div className="flex items-center gap-2 mb-3">
+        <FileSearch size={16} className="text-owner-500 animate-pulse" />
+        <span className="text-sm font-medium text-slate-600">
+          {data.label || steps[currentStep - 1] || '研究中'}...
+        </span>
+      </div>
+      <div className="flex items-center gap-1">
+        {steps.map((step, idx) => {
+          const stepNum = idx + 1;
+          const isActive = stepNum === currentStep;
+          const isDone = stepNum < currentStep;
+          return (
+            <React.Fragment key={idx}>
+              <div className="flex flex-col items-center flex-1 min-w-0">
+                <div className={`
+                  w-7 h-7 rounded-full flex items-center justify-center text-xs font-medium transition-all duration-300
+                  ${isDone ? 'bg-green-500 text-white' :
+                    isActive ? 'bg-owner-500 text-white ring-4 ring-owner-100' :
+                    'bg-slate-100 text-slate-400'}
+                `}>
+                  {isDone ? '✓' : stepNum}
+                </div>
+                <span className={`text-[10px] mt-1 text-center leading-tight truncate w-full ${
+                  isActive ? 'text-owner-600 font-medium' :
+                  isDone ? 'text-green-600' : 'text-slate-400'
+                }`}>
+                  {step}
+                </span>
+              </div>
+              {idx < steps.length - 1 && (
+                <div className={`h-0.5 flex-1 min-w-[12px] -mt-4 transition-colors duration-300 ${
+                  isDone ? 'bg-green-400' : 'bg-slate-200'
+                }`} />
+              )}
+            </React.Fragment>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 研究报告头部 — 标题卡片 + 目录
+ */
+export function ResearchReport({ data }) {
+  if (!data) return null;
+
+  return (
+    <Card gradient color="owner" className="animate-fade-in-up">
+      <div className="px-5 py-4">
+        <div className="flex items-center gap-2.5 mb-3">
+          <BookOpen size={18} className="text-owner-500" />
+          <h3 className="font-bold text-slate-800 text-base">{data.title}</h3>
+        </div>
+        {data.sections && data.sections.length > 0 && (
+          <div className="bg-white/60 rounded-xl p-4">
+            <p className="text-xs text-slate-400 font-medium uppercase tracking-wider mb-2">目录</p>
+            <div className="space-y-1.5">
+              {data.sections.map((section, idx) => (
+                <div key={idx} className="flex items-center gap-2 text-sm text-slate-600">
+                  <span className="text-xs text-owner-400 font-mono w-5">{idx + 1}.</span>
+                  <span>{section}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/**
  * 统一的结构化数据渲染器
  */
 export function StructuredDataRenderer({ type, data, onAction }) {
@@ -671,6 +757,8 @@ export function StructuredDataRenderer({ type, data, onAction }) {
     action_buttons: ActionButtons,
     thinking: ThinkingProcess,
     error: ErrorMessage,
+    research_progress: ResearchProgress,
+    research_report: ResearchReport,
   };
 
   const Component = components[type];
@@ -703,5 +791,7 @@ export default {
   ActionButtons,
   ThinkingProcess,
   ErrorMessage,
+  ResearchProgress,
+  ResearchReport,
   StructuredDataRenderer,
 };

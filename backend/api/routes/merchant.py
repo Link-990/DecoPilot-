@@ -6,7 +6,7 @@ import os
 import sys
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
@@ -18,6 +18,7 @@ from backend.core.output_formatter import (
     SubsidyResult, MerchantCard, TableData,
     create_subsidy_result
 )
+from backend.api.middleware.auth import get_current_user
 
 # 导入异步工具
 try:
@@ -26,7 +27,7 @@ try:
 except ImportError:
     ASYNC_UTILS_AVAILABLE = False
 
-router = APIRouter(prefix="/merchant", tags=["商家服务"])
+router = APIRouter(prefix="/merchant", tags=["商家服务"], dependencies=[Depends(get_current_user)])
 
 
 class SubsidyCalcRequest(BaseModel):
